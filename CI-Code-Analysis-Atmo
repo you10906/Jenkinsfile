@@ -1,0 +1,95 @@
+timestamps 
+{
+    
+    echo "Start to CI for Code Analysis."
+
+    //定义全局变量
+    paraseParams()
+
+    node('dev')
+    {
+      //构建前的准备工作
+      //1、设置个性化构建名字，用以区分每次构建对应的项目
+      currentBuild.displayName = "#" + BUILD_ID + " " + NAMESPACE + "/" + PROJECT_NAME
+
+      //2、清理工作空间
+      cleanWs()
+      
+      //构建步骤
+      //下载git工程
+        stage('下载代码') 
+        {
+            try
+            {
+                //pull git project
+                git branch: BRANCH, credentialsId: '9456db80-36f7-4a2b-b0df-c2eb93f00671', url: GIT_URL
+            }
+            catch(Exception ex)
+            { 
+                error "Pipeline Failed!!!"
+            }
+            
+        }
+
+        stage('打包编译') 
+        {   
+            try
+            {
+                def POM_PATH = '/pom.xml'
+               
+                sh 'mvn -B clean compile -DskipTests=true -f ' + workspace + POM_PATH
+            }
+            catch(Exception ex)
+            { 
+                error "Pipeline Failed!!!"
+            }
+           
+        }
+
+        stage('质量分析') 
+        {
+            try 
+            {   
+                echo "Start to SoanrQube Analysis."
+
+                if (!fileExists('sonar-project.properties'))
+	            { 
+	                error "Pipeline failed because of sonar-project.properties doesn't exist"
+	            }
+	            else
+	            {
+	                //替换版本，用于对比指标，指定与develop版本做比较
+	            	sh 'sed -i \'s/^sonar.projectVersion.*/sonar.projectVersion=develop/g\'  sonar-project.properties'
+	            }
+
+                def scannerHome = tool 'sonar-scanner';
+                withSonarQubeEnv('sonarqube') 
+                {
+                    sh "${scannerHome}/bin/sonar-scanner"
+                }
+
+                //等待质量门禁分析结果
+                timeout(time: 1, unit: 'HOURS') 
+                {
+                    echo 'waiting sonar quality gate'
+                    waitForQualityGate()
+                }
+            }
+            catch(Exception ex)
+            { 
+                error "Pipeline Failed!!!"
+            }
+        }
+    }
+}
+
+def paraseParams()
+{
+    NAMESPACE=PROJECT.split("/")[0]
+    PROJECT_NAME=PROJECT.split("/")[1]
+ 
+    //git@git.cs2025.com:uimpteam/cs-uimp-cloud.git
+    GIT_URL = 'git@git.cs2025.com:' + PROJECT + '.git'
+}
+
+

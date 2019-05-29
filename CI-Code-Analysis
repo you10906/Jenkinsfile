@@ -1,0 +1,537 @@
+timestamps 
+{
+    
+    echo "Start to CI for Code Analysis."
+
+    //定义全局变量
+    setGlobalVaribles()
+
+    maven_project = 'true'
+
+    node('dev')
+    {
+      //构建前的准备工作
+      //1、设置个性化构建名字，用以区分每次构建对应的项目
+      currentBuild.displayName = "#" + BUILD_ID + " " + SOURCE_NAMESPACE + "/" + SOURCE_REPO_NAME
+      currentBuild.description = MERGE_REQUEST_TITLE
+      
+      //2、通知gitlab正在执行构建任务
+      updateGitlabCommitStatus name: 'build', state: 'running'
+
+      //3、清理工作空间
+      cleanWs()
+      
+      //构建步骤
+      //下载git工程
+        stage('下载代码') 
+        {
+            try
+            {
+                //pull git project
+                git branch: SOURCE_BRANCH, credentialsId: '9456db80-36f7-4a2b-b0df-c2eb93f00671', url: SOURCE_REPO_SSH_URL
+            }
+            catch(Exception ex)
+            { 
+                //下载代码出现异常时，通知gitlab
+                updateGitlabCommitStatus name: 'build', state: 'failed'
+                addGitLabMRComment comment: "CI构建失败，原因：下载代码失败，详情请查看jenkins构建日志"
+                
+                //发送构建失败邮件
+                sendEmail("3")
+                error "Pipeline Failed!!!"
+            }
+            
+            if (!fileExists('pom.xml'))
+            { 
+                echo 'The project is not maven project, skip to code analysis'
+                
+                //更新git状态
+                updateGitlabCommitStatus name: 'build', state: 'success'
+
+                //在git上添加comment
+                addGitLabMRComment comment: '非maven工程，暂不做质量分析'
+
+                maven_project = 'false'
+                return;
+            }
+        }
+
+        stage('打包编译') 
+        {   
+            if ( 'false' == maven_project)
+            {
+                return;
+            }
+
+            //没有sonar-project.properties文件无法执行质量分析，不需要编译，直接抛错
+            if (!fileExists('sonar-project.properties'))
+            {
+                //发送构建失败邮件
+                sendEmail("6")
+                error "项目跟目录下没有sonar-project.properties文件，无法执行质量分析，请配置该文件！！！"
+            }
+            
+            try
+            {
+                def POM_PATH = '/pom.xml'
+                 
+                //部分项目有多级目录，pom文件不在根目录下，需要根据项目实际情况指定pom路径，TODO：当前做硬编码处理，后续需要考虑如何适配
+                if ( SOURCE_REPO_NAME == 'oauth2')
+                {
+                  POM_PATH = '/oauth2-server/pom.xml' 
+                }
+                
+                sh 'mvn -B clean compile -DskipTests=true -f ' + workspace + POM_PATH
+            }
+            catch(Exception ex)
+            { 
+                //maven编译或SonarQube出现异常时，通知gitlab
+                updateGitlabCommitStatus name: 'build', state: 'failed'
+                addGitLabMRComment comment: "CI构建失败，原因：打包编译失败，详情请查看jenkins构建日志"
+                
+                //发送构建失败邮件
+                sendEmail("4")
+                error "Pipeline Failed!!!"
+            }
+           
+        }
+
+        stage('质量分析') 
+        {
+            if ( 'false' == maven_project)
+            {
+                return;
+            }
+
+            try 
+            {
+                echo "Start to SoanrQube Analysis."
+                
+                def scannerHome = tool 'sonar-scanner';
+                withSonarQubeEnv('sonarqube') 
+                {
+                    sh "${scannerHome}/bin/sonar-scanner"
+                }
+
+                //等待质量门禁分析结果，将状态反馈给gitlab
+                timeout(time: 1, unit: 'HOURS') 
+                { 
+                    // Just in case something goes wrong, pipeline will be killed after a timeout
+                    def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                    if (qg.status == 'OK' || qg.status == 'WARN') 
+                    {
+                        echo "quality gate success: ${qg.status}"
+
+                        //更新git状态
+                        updateGitlabCommitStatus name: 'build', state: 'success'
+
+                        //在git上添加comment
+                        addGitLabMRComment comment: '通过代码门禁检查'
+                        
+                        //质量门禁通过邮件
+                        sendEmail("1")
+                    }
+                    else
+                    {
+                        echo "quality gate failure: ${qg.status}"
+                        updateGitlabCommitStatus name: 'build', state: 'failed'
+                        addGitLabMRComment comment: '未通过代码门禁检查'
+
+                        //质量门禁未通过邮件
+                        sendEmail("2")
+                    }
+
+                }
+                
+            }
+            catch(Exception ex)
+            { 
+                //maven编译或SonarQube出现异常时，通知gitlab
+                updateGitlabCommitStatus name: 'build', state: 'failed'
+                addGitLabMRComment comment: "CI构建失败，原因：SonarQube质量分析失败，请检查项目根目录下的sonar-project.properties文件配置是否正确，详情请查看jenkins构建日志"
+                
+                //发送构建失败邮件
+                sendEmail("5")
+                error "Pipeline Failed!!!"
+            }
+        }
+    }
+}
+
+//参数emailType
+//1: 门禁通过
+//2：门禁未通过
+//3：下载代码失败
+//4：打包失败
+//5: 质量分析失败
+//6: sonar-project.properties不存在
+def sendEmail(emailType)
+{
+    echo "Start to send email."
+  
+    //查询git项目成员的邮箱地址，作为邮件接收人
+    getProjectUserEmailList()
+
+    //jenkins构建日志地址
+    CONSOLE_URL = BUILD_URL + "console"
+
+    //SonarQube地址
+    SONAR_PROJECT_URL = SONAR_URL + "/dashboard/index/" + SOURCE_REPO_NAME
+        
+    //获取指派人的名字，并拼接邮箱后缀，将邮件抄送给指派的merge人员
+    //TODO git传过来的指派人有时为空，需定位原因
+    if (env.gitlabMergeRequestAssignee)
+    {
+        ASSIGNEE_EMAIL = env.gitlabMergeRequestAssignee + "@chalco-steering.com"
+    }
+    else
+    {
+        ASSIGNEE_EMAIL = "renyou@chalco-steering.com"
+    }
+
+    //邮件内容的抬头和结尾
+    BODY_FRONT = "(本邮件由CI构建自动发送，请勿回复！)<br/><hr/>项目名称：${SOURCE_REPO_NAME}<br/><br/>分支名称：${SOURCE_BRANCH}"
+    BODY_END = "<br/><br/><hr/><font size=\"2\" face=\"Times\"> 您能收到此邮件是因为您是${SOURCE_NAMESPACE}群组的成员或是${SOURCE_REPO_NAME}项目的成员，如有疑问请联系平台组任游。</front>"
+    
+    if (emailType == '1' || emailType == '2')
+    {
+        def checkResult = emailType == '1' ? "通过" : "未通过"
+        def titlePrefix = emailType == '1' ? "请知" : "重要"
+        //查询质量门禁详情
+        getProjectAnalyses()
+        
+        //查询质量检查详情
+        getProjectMetric()
+       
+        emailext body:  
+        """
+        ${BODY_FRONT}
+        <br/><br/>
+        CI构建日志：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a>
+        <br/><br/>
+        质量检查结果：${checkResult}
+        <br/><br/>
+        质量报告地址：<a href=${SONAR_PROJECT_URL}>${SONAR_PROJECT_URL}</a>
+        <br/>
+        <h3>质量门禁详情：</h3>
+        <table border=\"1\"  width=\"60%\">
+          <tr>
+            <th width=\"40%\">度量项</th>
+            <th width=\"20%\">指标</th>
+            <th width=\"20%\">实际值</th>
+            <th width=\"20%\">状态</th>
+          </tr>
+          <tr>
+            <td align=\"center\">可靠性</td>
+            <td align=\"center\">C</td>
+            <td align=\"center\">${RELIABILITY_RATING}</td>
+            <td align=\"center\">${RELIABILITY_RATING_FLAG}</td>
+          </tr>
+          <tr>
+            <td align=\"center\">安全性</td>
+            <td align=\"center\">C</td>
+            <td align=\"center\">${SECURITY_RATING}</td>
+            <td align=\"center\">${SECURITY_RATING_FLAG}</td>
+          </tr>
+          <tr>
+            <td align=\"center\">SQALE评级</td>
+            <td align=\"center\">C</td>
+            <td align=\"center\">${SQALE_RATING}</td>
+            <td align=\"center\">${SQALE_RATING_FLAG}</td>
+          </tr>
+          <tr>
+            <td align=\"center\">覆盖率(%)</td>
+            <td align=\"center\">60</td>
+            <td align=\"center\">${COVERAGE}</td>
+            <td align=\"center\">${COVERAGE_FLAG}</td>
+          </tr>
+          <tr>
+            <td align=\"center\">重复行(%)</td>
+            <td align=\"center\">20</td>
+            <td align=\"center\">${DUPLICATED_LINES_DENSITY}</td>
+            <td align=\"center\">${DUPLICATED_LINES_DENSITY_FLAG}</td>
+          </tr>
+          <tr>
+            <td align=\"center\">技术债务</td>
+            <td align=\"center\">7天</td>
+            <td align=\"center\">${SQALE_INDEX}</td>
+            <td align=\"center\">${SQALE_INDEX_FLAG}</td>
+          </tr>
+        </table>
+        <h3>代码质量总览：</h3>
+        <table border=\"1\"  width=\"60%\">
+          <tr>
+            <th>代码量</th>
+            <th>缺陷(可靠性)</th>
+            <th>漏洞(安全性)</th>
+            <th>坏味道(可维护)</th>
+            <th>覆盖率</th>
+            <th>重复率</th>
+            <th>重复块</th>
+          </tr>
+          <tr>
+            <td width=\"14%\" align=\"center\">${NCLOC}</td>
+            <td width=\"14%\" align=\"center\">${BUGS} (${RELIABILITY_RATING})</td>
+            <td width=\"14%\" align=\"center\">${VULNERABILITIES} (${SECURITY_RATING})</td>
+            <td width=\"14%\" align=\"center\">${CODE_SMELLS} (${SQALE_RATING})</td>
+            <td width=\"14%\" align=\"center\">${COVERAGE}%</td>
+            <td width=\"14%\" align=\"center\">${DUPLICATED_LINES_DENSITY}%</td>
+            <td width=\"14%\" align=\"center\">${DUPLICATED_BLOCKS}</td>
+          </tr>
+        </table>
+        ${BODY_END}
+        """, 
+        subject: "【${titlePrefix}】 ${SOURCE_NAMESPACE}/${SOURCE_REPO_NAME}代码质量检查${checkResult}",  
+        to: "${EMAIL_ADDR_LIST}"
+    }
+    else if (emailType == '3')
+    {
+        //下载代码失败
+        emailext body:  "${BODY_FRONT}<br/><br/>CI构建结果：下载代码失败<br/><br/>CI构建日志：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a>${BODY_END}", subject: "【严重】 ${SOURCE_NAMESPACE}/${SOURCE_REPO_NAME}代码质量分析失败",  to: "${EMAIL_ADDR_LIST}"
+    }
+    else if (emailType == '4')
+    {
+        //打包编译失败
+        emailext body:  "${BODY_FRONT}<br/><br/>CI构建结果：打包编译失败<br/><br/>CI构建日志：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a>${BODY_END}", subject: "【严重】 ${SOURCE_NAMESPACE}/${SOURCE_REPO_NAME}代码质量分析失败",  to: "${EMAIL_ADDR_LIST}"
+    }
+    else if (emailType == '5')
+    {
+        //质量分析失败
+        emailext body:  "${BODY_FRONT}<br/><br/>CI构建结果：编译成功，质量分析失败，请检查sonar-project.properties文件配置是否正确<br/><br/>CI构建日志：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a>${BODY_END}", subject: "【严重】 ${SOURCE_NAMESPACE}/${SOURCE_REPO_NAME}代码质量分析失败",  to: "${EMAIL_ADDR_LIST}"
+    }
+    else if (emailType == '6')
+    {
+        //质量分析失败
+        emailext body:  "${BODY_FRONT}<br/><br/>CI构建结果：编译成功，质量分析失败，请确保项目根目录下存在sonar-project.properties文件<br/><br/>CI构建日志：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a>${BODY_END}", subject: "【严重】 ${SOURCE_NAMESPACE}/${SOURCE_REPO_NAME}代码质量分析失败",  to: "${EMAIL_ADDR_LIST}"
+    }
+}
+
+//查询质量分析详情，获取未通过的检查项
+def getProjectAnalyses()
+{   
+    echo "Get the quality gate status of a project"
+
+    //sianrqube质量指标映射
+    def qualityMetricMap = ['1':'A', '2':'B', '3':'C', '4':'D','5':'E']
+    def qualityStatusMap = ['OK':'是', 'ERROR':'否']
+
+    def reqUrl = SONAR_URL + '/api/qualitygates/project_status?projectKey=' + SOURCE_REPO_NAME
+    def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', authentication: '91249c9c-cecf-42c5-8ad6-3ac724e3a887', consoleLogResponseBody: true, contentType: 'APPLICATION_JSON', url: reqUrl
+    
+    def result = new groovy.json.JsonSlurperClassic().parseText(response.content);
+    
+    conditionList = result.projectStatus.conditions
+
+    for(conditions in conditionList)
+    {
+        if ( 'sqale_rating' == conditions.metricKey)
+        {
+            SQALE_RATING_FLAG = conditions.status
+            SQALE_RATING = qualityMetricMap[conditions.actualValue]
+        }
+        else if ( 'reliability_rating' == conditions.metricKey)
+        {
+            RELIABILITY_RATING_FLAG = conditions.status
+            RELIABILITY_RATING = qualityMetricMap[conditions.actualValue]
+        }
+        else if ( 'security_rating' == conditions.metricKey)
+        {
+            SECURITY_RATING_FLAG = conditions.status
+            SECURITY_RATING = qualityMetricMap[conditions.actualValue]
+        }
+        else if ( 'coverage' == conditions.metricKey)
+        {
+            COVERAGE_FLAG = conditions.status
+        }
+        else if ( 'duplicated_lines_density' == conditions.metricKey)
+        {
+            DUPLICATED_LINES_DENSITY_FLAG = conditions.status
+        }
+        else if ( 'sqale_index' == conditions.metricKey)
+        {
+            SQALE_INDEX_FLAG = conditions.status
+        }
+    }
+
+}
+
+//调SonarQube接口查询项目质量指标
+def getProjectMetric()
+{
+    echo "Get components or children with specified measures of a project"
+    
+    //def param = new HashMap()
+    //def reqBody = new groovy.json.JsonBuilder(param).toString();
+
+    def qualityMetricMap = ['1':'A', '2':'B', '3':'C', '4':'D', '5':'E']
+
+    //需要查询的指标列表
+    //metricKeys = 'ncloc,bugs,new_bugs,duplicated_lines_density,new_duplicated_lines_density,new_vulnerabilities,vulnerabilities'
+    metricKeys = 'ncloc,bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,duplicated_blocks,reliability_rating,security_rating,sqale_rating,sqale_index'
+
+
+    def reqUrl = SONAR_URL + '/api/measures/component' + '?metricKeys=' + metricKeys + '&component=' + SOURCE_REPO_NAME
+    
+    
+    def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', authentication: '91249c9c-cecf-42c5-8ad6-3ac724e3a887', consoleLogResponseBody: true, contentType: 'APPLICATION_JSON', url: reqUrl
+     
+    def result = new groovy.json.JsonSlurperClassic().parseText(response.content);
+    
+    measuresList = result.component.measures
+
+    for(measure in measuresList)
+    {
+        if ('bugs' == measure.metric)
+        {
+          BUGS = measure.value
+        }   
+        else if ('vulnerabilities' == measure.metric)
+        {
+          VULNERABILITIES = measure.value
+        }
+        else if ('duplicated_lines_density' == measure.metric)
+        {
+          DUPLICATED_LINES_DENSITY = measure.value
+        }
+        else if ('code_smells' == measure.metric)
+        {
+          CODE_SMELLS = measure.value
+        }
+        else if ('coverage' == measure.metric)
+        {
+          COVERAGE = measure.value
+        }
+        else if ('duplicated_blocks' == measure.metric)
+        {
+          DUPLICATED_BLOCKS = measure.value
+        }
+        else if ('ncloc' == measure.metric)
+        {
+          NCLOC = measure.value
+        }
+        /*else if ('reliability_rating' == measure.metric)
+        {
+          RELIABILITY_RATING = qualityMetricMap[measure.value]
+        }
+        else if ('security_rating' == measure.metric)
+        {
+          SECURITY_RATING = qualityMetricMap[measure.value]
+        }
+        else if ('sqale_rating' == measure.metric)
+        {
+          SQALE_RATING = qualityMetricMap[measure.value]
+        }*/
+        else if ('sqale_index' == measure.metric)
+        {
+          SQALE_INDEX = measure.value
+        }     
+    }
+
+    //数据处理
+    if (CODE_SMELLS.toInteger() > 1000)
+    {
+        CODE_SMELLS = (CODE_SMELLS.toInteger()/1000).setScale(1,BigDecimal.ROUND_HALF_UP) + 'k'
+    }
+    if (DUPLICATED_BLOCKS.toInteger() > 1000)
+    {
+        DUPLICATED_BLOCKS = (DUPLICATED_BLOCKS.toInteger()/1000).setScale(1,BigDecimal.ROUND_HALF_UP) + 'k'
+    }
+    if (NCLOC.toInteger() > 1000)
+    {
+        NCLOC = (NCLOC.toInteger()/1000).setScale(1,BigDecimal.ROUND_HALF_UP) + 'k'
+    }
+
+    //接口返回的技术债务单位为分钟，需要转换成天、小数、分钟，一天按8小数算
+    if (SQALE_INDEX.toInteger() >= 60 && SQALE_INDEX.toInteger() < 60*8 )
+    {
+        SQALE_INDEX = (SQALE_INDEX.toInteger()/60).setScale(0,BigDecimal.ROUND_HALF_UP) + '小时'
+    }
+    else if (SQALE_INDEX.toInteger() >= 60*8)
+    {
+        SQALE_INDEX = (SQALE_INDEX.toInteger()/480).setScale(0,BigDecimal.ROUND_HALF_UP) + '天'
+    }
+    else
+    {
+        SQALE_INDEX = SQALE_INDEX + '分钟'
+    }
+}
+
+//定义全局变量
+def setGlobalVaribles()
+{
+    SOURCE_BRANCH = env.gitlabSourceBranch
+    SOURCE_REPO_SSH_URL = env.gitlabSourceRepoSshUrl
+    USER_EMAIL = env.gitlabUserEmail
+    SOURCE_REPO_NAME = env.gitlabSourceRepoName
+    SOURCE_NAMESPACE = env.gitlabSourceNamespace
+    MERGE_REQUEST_TITLE = env.gitlabMergeRequestTitle
+    MERGE_REQUEST_STATE = env.gitlabMergeRequestState
+    echo "Parameters list: SOURCE_BRANCH="+ SOURCE_BRANCH + " ,SOURCE_REPO_SSH_URL=" + SOURCE_REPO_SSH_URL + " ,USER_EMAIL=" + USER_EMAIL + " ,SOURCE_REPO_NAME=" + SOURCE_REPO_NAME + " ,SOURCE_NAMESPACE=" + SOURCE_NAMESPACE + " ,MERGE_REQUEST_TITLE=" + MERGE_REQUEST_TITLE + " ,MERGE_REQUEST_STATE=" + MERGE_REQUEST_STATE
+      
+    echo "gitlabActionType=" +  env.gitlabActionType + "gitlabTargetBranch=" +  env.gitlabTargetBranch + "gitlabMergedByUser=" +  env.gitlabMergeRequestTitle + " ,gitlabMergeRequestAssignee=" + env.gitlabMergeRequestAssignee + " , gitlabMergeRequestLastCommit=" + env.gitlabMergeRequestLastCommit
+    
+    //初始化质量指标变量：代码量，缺陷，漏洞，怀味道，覆盖率，重复率，重复块
+    NCLOC = '0'
+    BUGS = '0'
+    VULNERABILITIES = '0'
+    CODE_SMELLS = '0'
+    COVERAGE = '0'
+    DUPLICATED_LINES_DENSITY = '0'
+    DUPLICATED_BLOCKS = '0'
+
+    //质量门禁指标及状态：安全性，稳定性，SQALE评级，技术债务
+    SECURITY_RATING_FLAG = ''
+    SECURITY_RATING = ''
+    RELIABILITY_RATING_FLAG = '' 
+    RELIABILITY_RATING = '' 
+    SQALE_RATING_FLAG = '' 
+    SQALE_RATING = '' 
+    SQALE_INDEX_FLAG = '' 
+    SQALE_INDEX = ''
+    DUPLICATED_LINES_DENSITY_FLAG = ''
+    COVERAGE_FLAG = ''
+
+    //SoanrQube服务地址
+    SONAR_URL= 'http://192.168.10.251:9000'
+    
+    //gitlab地址
+    GIT_URL = 'http://git.cs2025.com'
+
+    //邮件接收人地址列表（主送提交人，抄送项目成员）
+    EMAIL_ADDR_LIST = USER_EMAIL
+}
+
+def getProjectUserEmailList()
+{
+    projectUserList = getProjectUsers()
+
+    for (projectUser in projectUserList)
+    {
+        userDetailInfo = getUserInfo(projectUser.id)
+        EMAIL_ADDR_LIST += " ,cc:${userDetailInfo.email}" 
+    }
+ 
+    //TODO 前期固定抄送renyou, 等CI构建稳定后移除
+    EMAIL_ADDR_LIST += " ,cc:renyou@chalco-steering.com" 
+
+}
+
+//查询git项目的成员邮箱地址
+def getProjectUsers()
+{
+    
+    def reqUrl = GIT_URL + '/api/v4/projects/' + SOURCE_NAMESPACE + '%2F' + SOURCE_REPO_NAME + '/users'
+    
+    def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', customHeaders: [[maskValue: false, name: 'PRIVATE-TOKEN', value: '1HieJMYZZ4cNoiue8-5p']], contentType: 'APPLICATION_JSON', url: reqUrl
+
+    return new groovy.json.JsonSlurperClassic().parseText(response.content);    
+}
+
+def getUserInfo(userId)
+{
+    def reqUrl = GIT_URL + '/api/v4/users/' + userId
+
+    def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', customHeaders: [[maskValue: false, name: 'PRIVATE-TOKEN', value: '1HieJMYZZ4cNoiue8-5p']],  contentType: 'APPLICATION_JSON', url: reqUrl
+
+    return new groovy.json.JsonSlurperClassic().parseText(response.content);    
+}

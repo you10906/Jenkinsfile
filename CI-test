@@ -1,0 +1,16 @@
+timestamps 
+{
+    //执行节点，默认使用dev节点
+    NODE_LABLE = 'docker-slave' 
+
+    node(NODE_LABLE) 
+    {
+        stage 'test1'
+        echo '测试1'
+        stage 'test2'
+        echo '测试2'
+        stage 'test3'
+        echo '测试4'
+        echo '测试5'
+    }
+}

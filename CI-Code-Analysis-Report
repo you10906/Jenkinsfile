@@ -1,0 +1,233 @@
+import java.text.SimpleDateFormat;
+import java.util.Calendar; 
+timestamps 
+{
+    echo "Start to Code Analysis."
+    echo 'PROJECTS='+PROJECTS
+    echo 'BRANCH='+BRANCH
+
+    setGlobalVaribles()
+
+    node('dev')
+    {  
+        try
+        {
+            stage('质量分析')
+            {   
+                setSonarLeadPeriod('develop')
+                
+                projectList=Arrays.asList(PROJECT_LIST);  
+
+                //每N个项目分为一组并发执行，避免占用节点过多资源，用时间换资源
+                projectGroups = projectList.collate(3) 
+                 
+                for (projectGroup in projectGroups)
+                {
+                    def projects = [:]
+                    for (project in projectGroup) 
+                    {
+                        //需要单独定义一个变量，否则并发执行时，会频繁拉起同一个任务
+                        def projectURI = project
+                        projects[projectURI] = 
+                        {
+                          build job: 'CI-Code-Analysis-Atmo', parameters: [string(name: 'PROJECT', value: projectURI), string(name: 'BRANCH', value: BRANCH)], propagate: false
+                        }
+                    }
+
+                    parallel projects
+                }
+
+                
+            }
+            stage('生成报告')
+            {
+                for (PROJECT in PROJECT_LIST)
+                {
+                    projectGroup=PROJECT.split("/")[0]
+                    projectName=PROJECT.split("/")[1]
+                    getProjectMetric(projectName)
+                    buildEmailContent(projectGroup, projectName);
+
+                }
+                EMAIL_CONTENT += "</table>"
+                //echo 'EMAIL_CONTENT='+EMAIL_CONTENT
+                emailext body:  "${EMAIL_CONTENT}", subject: "质量报告",  to: "${RECIPIENTS}"
+                
+            }
+        }
+        catch(Exception ex)
+        {   
+            error "Pipeline Failed!!!" + ex
+        }
+        finally
+        {
+            //将对比指标重置为默认值
+            resetSonarSetting()
+        }  
+    }
+}
+
+//定义全局变量
+def setGlobalVaribles()
+{   
+    SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd");
+    Date date = new Date();
+    TODAY = f.format(date);
+
+    //上一次构建时间
+    previousBuildMillis = currentBuild.getPreviousBuild().startTimeInMillis
+    previousBuildDate = f.format(new Date(previousBuildMillis));
+
+    PROJECT_LIST = PROJECTS.replaceAll(" ", "").split(",")
+    //EMAIL_CONTENT = "<table border=\"1\"  width=\"100%\"><tr height=\"40px\"><th colspan=\"11\">项目质量报告</th></tr><tr><th>项目名称</th><th>所属群组</th><th>代码量</th><th>缺陷</th><th>漏洞</th><th>坏味道</th><th>重复率(%)</th><th>新增缺陷</th><th>新增漏洞</th><th>新增坏味道</th></tr>"
+
+    EMAIL_CONTENT = "<table border=\"1\"  width=\"100%\"><tr height=\"40px\"><th colspan=\"11\">项目质量报告</th></tr><tr><th colspan=\"2\">报告日期</th><td colspan=\"3\">${TODAY}</td><th colspan=\"3\">上次报告日期</th><td colspan=\"3\">${previousBuildDate}</td></tr><tr><th>项目名称</th><th>所属群组</th><th>代码量</th><th>缺陷</th><th>漏洞</th><th>坏味道</th><th>重复率(%)</th><th>新增缺陷</th><th>新增漏洞</th><th>新增坏味道</th></tr>"
+    //SoanrQube服务地址
+    SONAR_URL= 'http://192.168.10.251:9000'
+
+    NCLOC = '0'
+    BUGS = '0'
+    VULNERABILITIES = '0'
+    CODE_SMELLS = '0'
+    COVERAGE = '0'
+    DUPLICATED_LINES_DENSITY = '0'
+    DUPLICATED_BLOCKS = '0'
+    BUGS_CHANGE = '0'
+    NEW_VULNERABILITIES_CHANGE = '0'
+    NEW_CODE_SMELLS_CHANGE = '0'
+    NEW_DUPLICATED_LINES_DENSITY_CHANGE = '0'
+
+}
+
+def buildEmailContent(projectGroup, projectName)
+{
+    //SonarQube地址
+    SONAR_PROJECT_URL = SONAR_URL + "/dashboard/index/" + projectName
+
+    EMAIL_CONTENT += "<tr height=\"35px\">"
+    EMAIL_CONTENT += "<td width=\"18%\" align=\"center\"><a href=\"${SONAR_PROJECT_URL}\">${projectName}</a></td>"
+    EMAIL_CONTENT += "<td width=\"10%\" align=\"center\">${projectGroup}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${NCLOC}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${BUGS}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${VULNERABILITIES}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${CODE_SMELLS}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${DUPLICATED_LINES_DENSITY}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${BUGS_CHANGE}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${VULNERABILITIES_CHANGE}</td>"
+    EMAIL_CONTENT += "<td width=\"9%\" align=\"center\">${CODE_SMELLS_CHANGE}</td>"
+    //EMAIL_CONTENT += "<td width=\"7%\" align=\"center\">${DUPLICATED_LINES_DENSITY_CHANGE}</td>"
+    EMAIL_CONTENT += "</tr>"
+}
+
+
+//设置sonar对比视图，比较指标以及跟踪新问题的周期
+def setSonarLeadPeriod(leadPeriod)
+{
+    echo 'set sonar setting sonar.leak.period='+leadPeriod
+
+    def reqUrl = SONAR_URL + '/api/settings/set' + '?key=sonar.leak.period&value=' + leadPeriod
+    //def param = new HashMap()
+    //param.key = 'sonar.leak.period'
+    //param.value = leadPeriod
+    //def reqBody = new groovy.json.JsonBuilder(param).toString();
+    //echo 'reqBody='+reqBody
+
+    httpRequest  httpMode: 'POST', authentication: '91249c9c-cecf-42c5-8ad6-3ac724e3a887', consoleLogResponseBody: true, url: reqUrl
+
+}
+
+//重置sonar配置
+def resetSonarSetting()
+{
+    echo 'reset sonar setting sonar.leak.period'
+    def reqUrl = SONAR_URL + '/api/settings/reset' + '?keys=sonar.leak.period'
+    //def param = new HashMap()
+    //param.key = 'sonar.leak.period'
+    //def reqBody = new groovy.json.JsonBuilder(param).toString();
+    //echo 'reqBody='+reqBody
+
+    httpRequest  httpMode: 'POST', authentication: '91249c9c-cecf-42c5-8ad6-3ac724e3a887', consoleLogResponseBody: true, url: reqUrl
+
+}
+
+//调SonarQube接口查询项目质量指标
+def getProjectMetric(projectName)
+{
+    echo "Get components or children with specified measures of a project"
+    
+    //def param = new HashMap()
+    //def reqBody = new groovy.json.JsonBuilder(param).toString();
+
+    def qualityMetricMap = ['1':'A', '2':'B', '3':'C', '4':'D', '5':'E']
+
+    //需要查询的指标列表
+    metricKeys = 'ncloc,bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,duplicated_blocks'
+
+
+    def reqUrl = SONAR_URL + '/api/measures/component' + '?metricKeys=' + metricKeys + '&component=' + projectName
+    
+    
+    def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', authentication: '91249c9c-cecf-42c5-8ad6-3ac724e3a887', consoleLogResponseBody: true, contentType: 'APPLICATION_JSON', url: reqUrl
+     
+    def result = new groovy.json.JsonSlurperClassic().parseText(response.content);
+    
+    measuresList = result.component.measures
+
+    for(measure in measuresList)
+    {
+        if ('bugs' == measure.metric)
+        {
+          BUGS = measure.value
+          BUGS_CHANGE = '0'
+
+          if (measure.periods)
+          {
+            BUGS_CHANGE = measure.periods[0].value
+          }
+        }   
+        else if ('vulnerabilities' == measure.metric)
+        {
+          VULNERABILITIES = measure.value
+          VULNERABILITIES_CHANGE = '0'
+
+          if (measure.periods)
+          {
+            VULNERABILITIES_CHANGE = measure.periods[0].value
+          }
+        }
+        else if ('duplicated_lines_density' == measure.metric)
+        {
+          DUPLICATED_LINES_DENSITY = measure.value
+          DUPLICATED_LINES_DENSITY_CHANGE = '0'
+
+          if (measure.periods)
+          {
+            DUPLICATED_LINES_DENSITY_CHANGE = measure.periods[0].value
+          }
+        }
+        else if ('code_smells' == measure.metric)
+        {
+          CODE_SMELLS = measure.value
+          CODE_SMELLS_CHANGE = '0'
+
+          if (measure.periods)
+          {
+            CODE_SMELLS_CHANGE = measure.periods[0].value
+          }
+        }
+        else if ('ncloc' == measure.metric)
+        {
+          NCLOC = measure.value
+        }
+    }
+
+    //数据处理
+    if (CODE_SMELLS.toInteger() > 1000)
+    {
+        CODE_SMELLS = (CODE_SMELLS.toInteger()/1000).setScale(1,BigDecimal.ROUND_HALF_UP) + 'k'
+    }
+    if (NCLOC.toInteger() > 1000)
+    {
+        NCLOC = (NCLOC.toInteger()/1000).setScale(1,BigDecimal.ROUND_HALF_UP) + 'k'
+    }
+}

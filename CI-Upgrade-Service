@@ -1,0 +1,126 @@
+timestamps 
+{
+   echo "inputContent="+inputContent
+   
+   //解析参数 
+   def params = parseInputContent(inputContent)
+   echo "node lable="+params.nodeLable
+   
+   //在指定节点运行 
+   node(params.nodeLable) 
+   {
+        imageUrl = params.imageUrl.trim()
+        environmentName = params.environmentName.trim()
+        serviceName = params.serviceName.trim()
+        CCAPI_URL = params.ccapiUrl.trim()
+
+        //根据环境名称查询环境id
+        environmentId = getEnvironmentId(environmentName)
+
+        if (!environmentId)
+        {
+           error '查询环境ID返回为空'
+        }
+    
+        //获取指定环境下的所有服务组
+        groupList = getGroupListByEnvId(environmentId)
+    
+        //根据服务名称过滤出其所属的服务组ID
+        groupId = getGroupIdByServiceName(serviceName)
+        if (!groupId)
+        {
+           error '查询服务组ID返回为空'
+        }
+
+        //升级应用
+        upgradeService()
+   }
+}
+
+def parseInputContent(inputContent)
+{
+    return new groovy.json.JsonSlurperClassic().parseText(inputContent)
+}
+
+def getEnvironmentId(environmentName)
+{
+    //查询环境列表
+    try
+    {   
+      reqUrl = CCAPI_URL + '/api/environments'
+      def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', url: reqUrl
+
+      def envList = new groovy.json.JsonSlurperClassic().parseText(response.content).data;
+
+      for (envInfo in envList)
+      {
+        if ( environmentName == envInfo.environmentName)
+        { 
+          echo "${environmentName}的环境ID是： " + envInfo.environmentId
+          return envInfo.environmentId
+        }
+      }
+    }
+    catch(Exception ex)
+    {
+      error '获取环境ID失败，' + ex
+    } 
+}
+
+//获取指定环境下的所有服务组
+def getGroupListByEnvId(environmentId)
+{
+    try
+    {
+      reqUrl = CCAPI_URL + '/api/environments/' + environmentId + '/groups'
+
+      def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', url: reqUrl
+
+      return new groovy.json.JsonSlurperClassic().parseText(response.content).data;
+    }
+    catch(Exception ex)
+    {
+      error '获取服务组失败，' + ex
+    } 
+}
+ 
+//获取指定环境下的所有group
+def getGroupIdByServiceName(serviceName)
+{
+    try
+    {
+      for (group in groupList)
+      {
+        reqUrl = CCAPI_URL + '/api/environments/' + environmentId + '/groups/' + group.id + '/services'
+        def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', url: reqUrl
+        def serviceList = new groovy.json.JsonSlurperClassic().parseText(response.content).data;
+
+        for (service in serviceList)
+        {
+          if ( serviceName == service.id)
+          {
+            echo "${serviceName}所属服务组是${group.name}, 服务组ID是： ${group.id}"
+            return group.id
+          }
+        }
+
+      }
+    }
+    catch(Exception ex)
+    {
+      error '获取服务所属的服务组ID失败，' + ex
+    } 
+}
+
+def upgradeService()
+{
+  def parameter = new HashMap()
+        
+  parameter.patchType = 'image'
+  parameter.image = imageUrl
+
+  def reqBody = new groovy.json.JsonBuilder(parameter).toString();
+  def reqUrl = CCAPI_URL + '/api/environments/' + environmentId + '/groups/' + groupId + '/services/' + serviceName
+
+  httpRequest httpMode: 'PATCH',  contentType: 'APPLICATION_JSON', consoleLogResponseBody: true, ignoreSslErrors: true, requestBody: reqBody,  url: reqUrl
+}

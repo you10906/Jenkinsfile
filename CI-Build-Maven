@@ -1,0 +1,519 @@
+timestamps 
+{
+    //执行节点,不同类型的工程使用不同的节点进行构建
+    NODE_LABLE = 'maven' 
+
+    node(NODE_LABLE) 
+    {
+        //构建前的准备工作
+        //1、清理工作空间
+        //cleanWs()
+        
+        /*
+        //2、触发构建的用户
+        wrap([$class: 'BuildUser']) 
+        {
+            def user = env.BUILD_USER_ID
+            echo 'build user is ' + user
+        }*/
+
+        //2、定义全局变量
+        setGlobalParams()
+
+        //3、设置个性化构建名字，用以区分每次构建对应的项目
+        currentBuild.displayName = "#" + BUILD_ID + " " + imageName
+
+        stage('下载代码') 
+        {
+            try
+            {
+                checkout()
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("1")
+                echo "下载代码失败!!!"
+                retry(2) 
+                {
+                    input "重新下载代码?"
+                    checkout()
+                }
+
+            }       
+        }
+
+        //如果是由gitlab触发的构建，则读取项目根目录下的ci.yaml文件，如果没有该文件则跳过后续所有步骤，结束任务
+        if ( env.gitlabSourceRepoSshUrl && !fileExists('ci.yaml'))
+        {
+            echo '项目根目录下没有ci.yaml文件，无法执行后续构建步骤，结束任务。'
+            return
+        }
+        else if ( env.gitlabSourceRepoSshUrl )
+        {
+            try
+            {
+                def ci = readYaml file: 'ci.yaml'
+
+                projectType = ci.projectType
+                if (!ci.projectType)
+                {
+                    error 'ci.yaml文件没有设置projectType，结束构建任务。请根据项目类型设置projectType的值，当前的可选取值有：maven、nodejs、nuxt'
+                }
+
+                //优先取配置文件中设置的镜像名，否则以项目名作为镜像名
+                if ( ci.build && ci.build.imageName )
+                {
+                    imageName = ci.build.imageName
+                }
+
+                environmentName = ci.deployment.environmentName
+                serviceName = ci.deployment.serviceName
+                //testCaseName = ci.test.caseName
+                //testEnvUrl = ci.test.url
+
+                if (ci.codeAnalysis)
+                {
+                    codeAnalysis = 'true'
+                }
+                else
+                {
+                    codeAnalysis = 'false'
+                }
+            }
+            catch(Exception ex)
+            {
+                error '读取ci.yaml失败，请检查ci.yaml格式是否正确！！！' + ex
+            }
+        }
+
+        //如果设置了运行环境名称和服务名称，则用本次构建的镜像自动升级指定的应用
+        if ( environmentName && serviceName )
+        {
+            echo "environmentName=${environmentName}， serviceName=${serviceName}，需要升级指定应用"
+            upgradeFlag = 'true'
+        }
+
+        //如果设置了测试环境地址和测试工程名称，则执行自动化测试
+        /*
+        if ( testCaseName && testEnvUrl)
+        {
+            autoTest = 'true'
+        }
+        */
+
+        stage('打包编译') 
+        {
+            try
+            {
+                compile()
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("2")
+                echo "打包编译失败，请查看构建日志!!!"
+                retry(2) 
+                {
+                    input "重新打包编译?"
+                    compile()
+                }
+            }
+        }
+
+        stage('质量分析') 
+        {
+            try
+            {
+                //sonarCheck()
+
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("5")
+                echo "代码质量分析失败，请查看构建日志!!!"
+                retry(2) 
+                {
+                    input "重新质量分析?"
+                    sonarCheck()
+                }
+            }
+        }
+
+        stage('构建镜像') 
+        {
+            try
+            {
+                buildImage()
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("3")
+                echo "构建镜像失败，请查看构建日志!!!"
+                retry(2) 
+                {
+                    input "重新构建镜像?"
+                    buildImage()
+                }
+            }
+        
+        }
+
+        stage('推送镜像') 
+        {
+            try
+            {
+                pushImage()
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("3")
+                echo "推送镜像失败，请查看构建日志!!!"
+                retry(2) 
+                {
+                    input "重新推送镜像?"
+                    pushImage()
+                }
+            }
+        
+        }
+      
+        stage('自动化测试')
+        {
+            try
+            {
+                //拉起自动化测试任务，具体任务及参数待确认
+                //build job: 'test-project', parameters: [string(name: 'inputContent', value: params)]
+            }
+            catch(Exception ex)
+            {
+                //发送构建失败邮件
+                sendEmail("7")
+                error "执行自动化用例失败"
+            }
+        }
+
+        stage('升级应用') 
+        {  
+            try
+            {
+                upgrade()
+            }
+            catch(Exception ex)
+            { 
+                //发送构建失败邮件
+                sendEmail("4")
+                echo "升级应用失败，请查看构建日志!!!"
+                retry(2) 
+                {
+                    input "重新升级应用?"
+                    upgrade()
+                }
+            }
+        }
+        
+        //发送构建成功邮件
+        sendEmail("6")
+
+    }
+}
+
+def checkout()
+{
+    echo "###下载代码开始###"
+    //pull git project
+    if (branch)
+    {
+        git branch: branch, credentialsId: 'gitlab-pull-account', url: gitUrl
+    }
+    else
+    {
+        //如果入参没有传分支参数，默认取develop分支
+        git branch: 'develop', credentialsId: 'gitlab-pull-account', url: gitUrl             
+    }
+    echo "###下载代码结束###"
+}
+
+def compile()
+{
+    echo "###打包编译开始###"
+    
+    //执行maven命令
+    sh "mvn -B clean install -DskipTests=true -f ${WORK_PATH}/pom.xml"  
+    
+    echo "###打包编译结束###"
+}
+
+def buildImage()
+{  
+    echo "###构建镜像开始###"
+    
+    JAR_NAME = "${imageName}.jar"
+
+    //在当前workspace新建一个目录用于制作镜像
+
+    if (!fileExists("${IMAGE_DIR}"))
+    {
+        sh "mkdir -p ${WORK_PATH}/${IMAGE_DIR}"
+    }
+    
+    //如果项目中没有dockerfile，则使用默认dockerfile
+    if (!fileExists('Dockerfile'))
+    {
+        echo "Dockerfile doesn't exist"
+        sh "cp ${DEFAULT_DOCKERFILE} ${WORK_PATH}/${IMAGE_DIR}/Dockerfile"        
+    }
+    else
+    { 
+         echo "Dockerfile exist"
+         sh "cp ${WORK_PATH}/Dockerfile ${WORK_PATH}/${IMAGE_DIR}/Dockerfile"
+    }
+    
+    //将编译出的jar包复制到镜像制作目录
+    sh "cp ${WORK_PATH}/target/*.jar ${WORK_PATH}/${IMAGE_DIR}/${JAR_NAME}"
+
+    customImage = docker.build("${IMAGE_URI}:${IMAGE_TAG}", "--build-arg JAR_NAME=${JAR_NAME} -f ${WORK_PATH}/${IMAGE_DIR}/Dockerfile ${WORK_PATH}/${IMAGE_DIR}")
+    
+    echo "###构建镜像结束###"
+    
+}
+
+def pushImage()
+{
+    echo "###推送镜像开始###"
+
+    retry(4)
+    {
+        docker.withRegistry("http://${HARBOR_REGISTRY_HOST}", 'horbar-dev-auth') 
+        {
+            //推送镜像仓库
+            customImage.push()
+            customImage.push('latest')
+
+            //删除本地镜像, docker pipeline plugin目前未提供删除镜像的接口，因此这里通过shell脚本删除本地镜像
+            sh "docker rmi ${IMAGE_URI}:latest"
+            sh "docker rmi ${IMAGE_URI}:${IMAGE_TAG}"
+        }
+    }
+    
+    echo "###推送镜像结束###"
+}
+
+def upgrade()
+{
+    echo "###升级应用开始###"
+    if ( 'true' == upgradeFlag)
+    {
+        echo "用本次构建的镜像升级${environmentName}环境中名为${serviceName}的服务"
+        imageUrl = "${IMAGE_URI}:${IMAGE_TAG}"
+        
+        //根据环境名称查询环境id
+        environmentId = getEnvironmentId(environmentName)
+
+        if (!environmentId)
+        {
+           error '查询环境ID返回为空'
+        }
+
+        //升级应用
+        upgradeService()
+    }
+    else
+    {
+        echo "Don't upgrade deployment, skip this stage."
+    }
+    echo "###升级应用结束###"
+}
+
+def sonarCheck()
+{
+    echo "###代码质量检查开始###"
+    if ( 'true' == codeAnalysis)
+    {
+        echo "开始执行代码质量分析"
+        def scannerHome = tool 'sonar-scanner';
+        withSonarQubeEnv('sonarqube') 
+        {
+            sh "${scannerHome}/bin/sonar-scanner"
+        }
+    }
+    else
+    {
+        echo "Don't execute code analysis, skip this stage."
+    }
+    echo "###代码质量检查结束###"
+}
+
+//参数emailType
+//1: 下载代码失败
+//2：打包编译失败
+//3：构建镜像失败
+//4：升级应用失败
+//5: 质量分析失败
+//6: 构建成功
+def sendEmail(emailType)
+{
+    //TODO 暂时不发邮件
+    return;
+    echo "Start to send email."
+    
+    //jenkins构建日志地址
+    CONSOLE_URL = BUILD_URL + "console" 
+
+    SUBJECT= ""
+    BUILD_RESULT = ""
+
+    if (emailType == '1')
+    {
+        //下载代码失败
+        SUBJECT = "【严重】 ${imageName}构建失败"
+        BUILD_RESULT = "下载代码失败"
+    }
+    else if (emailType == '2')
+    {
+        //打包编译失败
+        SUBJECT = "【严重】 ${imageName}构建失败"
+        BUILD_RESULT = "打包编译失败"
+    }
+    else if (emailType == '3')
+    {
+        //构建镜像失败
+        SUBJECT = "【严重】 ${imageName}构建失败"
+        BUILD_RESULT = "构建镜像失败"
+    }
+    else if (emailType == '4')
+    {
+        //升级应用失败
+        SUBJECT = "【严重】 ${imageName}构建失败"
+        BUILD_RESULT = "升级应用失败"
+    }
+    else if (emailType == '5')
+    {
+        //质量分析失败
+        SUBJECT = "【重要】 ${imageName}构建失败"
+        BUILD_RESULT = "质量检查失败"
+    }
+    else if (emailType == '6')
+    {
+        //CI构建成功
+        SUBJECT = "【请知】 ${imageName}构建成功"
+        BUILD_RESULT = "成功"
+    }
+
+    EMAILEXT_BODY = "(本邮件由CI构建自动发送，请勿回复！)<br/><hr/>项目名称：${imageName}<br/><br/>分支名称：${branch}<br/><br/>CI构建结果：${BUILD_RESULT}<br/><br/>CI构建日志地址：<a href=${CONSOLE_URL}>${CONSOLE_URL}</a><br/>"
+
+    RECEIVER = "cc:renyou@chalco-steering.com, cc:qinlu@chalco-steering.com"
+
+    emailext body:  "${EMAILEXT_BODY}", subject: "${SUBJECT}",  to: "${RECEIVER}"
+}
+
+//参数处理
+def setGlobalParams()
+{
+    echo "###设置全局变量开始###"
+    setVariables()
+    setConstants() 
+    echo "###设置全局变量结束###"    
+}
+
+def setVariables()
+{
+    //默认不执行升级与自动化测试
+    upgradeFlag = 'false'
+    autoTest = 'false'
+
+    if (GIT_URL)
+    {
+        gitUrl = GIT_URL
+        branch = BRANCH_NAME
+        imageName = IMAGE_NAME
+        //projectType = PROJECT_TYPE
+        environmentName = ENVIRONMENT_NAME
+        serviceName = SERVICE_NAME
+        //testCaseName = TEST_CASE_NAME
+        //testEnvUrl = TEST_ENVIRONMENT_URL
+        codeAnalysis = CODE_ANALYSIS
+
+        //对应git项目下存在多个子项目的情况，需要指定子项目的名字
+        subProject = SUB_PROJECT
+    }
+    else
+    {   
+        gitUrl = env.gitlabSourceRepoSshUrl
+        branch = env.gitlabTargetBranch
+        userEmail = env.gitlabUserEmail
+        imageName = env.gitlabSourceRepoName
+        subProject = ''
+    }
+}
+
+def setConstants()
+{
+    //镜像制作地址，在workspace新建该目录，用于制作镜像
+    IMAGE_DIR = 'build_image'
+
+    if (subProject)
+    {   
+        echo '子项目名字：' + subProject
+        WORK_PATH = WORKSPACE + '/' + subProject
+    }
+    else
+    {
+        WORK_PATH = WORKSPACE
+    }
+    
+
+    IMAGE_URI = "${HARBOR_REGISTRY_HOST}/${HARBOR_REGISTRY_PROJECT}/${imageName}"
+}
+
+def login()
+{
+    reqUrl = OAUTH_URL + '/auth/login?username=admin&password=123456'
+    def response = httpRequest  httpMode: 'POST', acceptType: 'APPLICATION_JSON', url: reqUrl, quiet: true
+
+    return new groovy.json.JsonSlurperClassic().parseText(response.content).data.token;
+}
+
+def getEnvironmentId(environmentName)
+{
+    //查询环境列表
+    try
+    { 
+      token = login()  
+      reqUrl = CCAPI_URL + '/api/environments?token=' + token
+      def response = httpRequest  httpMode: 'GET', acceptType: 'APPLICATION_JSON', url: reqUrl
+
+      def envList = new groovy.json.JsonSlurperClassic().parseText(response.content).data;
+
+      for (envInfo in envList)
+      {
+        if ( environmentName == envInfo.environmentName)
+        { 
+          echo "${environmentName}的环境ID是： " + envInfo.environmentId
+          return envInfo.environmentId
+        }
+      }
+    }
+    catch(Exception ex)
+    {
+      error '获取环境ID失败，' + ex
+    } 
+}
+
+def upgradeService()
+{
+  token = login()
+
+  def parameter = new HashMap()
+        
+  parameter.patchType = 'image'
+  parameter.image = imageUrl
+  
+  def reqBody = new groovy.json.JsonBuilder(parameter).toString();
+  def reqUrl = CCAPI_URL + '/api/environments/' + environmentId + '/groups/default/services/' + serviceName + '?token=' + token
+
+  httpRequest httpMode: 'PATCH',  contentType: 'APPLICATION_JSON', consoleLogResponseBody: true, ignoreSslErrors: true, requestBody: reqBody,  url: reqUrl
+}
